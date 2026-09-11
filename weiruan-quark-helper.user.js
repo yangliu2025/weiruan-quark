@@ -7,14 +7,12 @@
 // @license      MIT
 // @icon         https://pan.quark.cn/favicon.ico
 // @match        *://pan.quark.cn/*
-// @grant        GM_xmlhttpRequest
 // @grant        GM_setClipboard
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_addStyle
 // @grant        unsafeWindow
 // @run-at       document-end
-// @connect      drive.quark.cn
 // @homepage     https://github.com/weiruankeji2025/weiruan-quark
 // ==/UserScript==
 
@@ -228,6 +226,16 @@
             }
         },
 
+        escapeHtml: (s) => String(s ?? '').replace(/[&<>"']/g, c => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        })[c]),
+
+        // 直链只需要 __puus，不要把整个 Cookie 交给下载器
+        getDownloadCookie: () => {
+            const m = document.cookie.match(/(?:^|;\s*)__puus=([^;]*)/);
+            return m ? `__puus=${m[1]}` : '';
+        },
+
         // 检测是否在分享页面
         isSharePage: () => {
             return location.pathname.includes('/s/') || location.search.includes('pwd_id');
@@ -312,12 +320,13 @@
                         for (const candidate of candidates) {
                             if (candidate && (candidate.fid || candidate.id || candidate.file_id)) {
                                 // 判断是否为文件夹 - 更保守的判断
+                                // 注意：category===0 是「其他类型文件」，不是文件夹
                                 const isDirectory =
                                     candidate.dir === true ||
                                     candidate.is_dir === true ||
                                     candidate.type === 'folder' ||
                                     candidate.obj_category === 'folder' ||
-                                    (candidate.category !== undefined && candidate.category === 0);
+                                    candidate.file_type === 0;
 
                                 const fileData = {
                                     fid: candidate.fid || candidate.id || candidate.file_id,
@@ -349,9 +358,13 @@
             if (fiberData) return fiberData;
 
             // 方法2: 从 data 属性获取
-            const dataFid = row.getAttribute('data-fid') || row.getAttribute('data-id') || row.getAttribute('data-file-id');
+            // 「最近」列表的 data-row-key 形如 <fid>***SAVE_SHARE-@-...***level1
+            const rowKey = row.getAttribute?.('data-row-key');
+            const dataFid = row.getAttribute('data-fid') || row.getAttribute('data-id') ||
+                row.getAttribute('data-file-id') ||
+                (rowKey && /^[0-9a-f]{32}/.test(rowKey) ? rowKey.split('***')[0] : null);
             if (dataFid) {
-                const fileName = row.querySelector('.file-name, .name, [class*="fileName"], [class*="file_name"]')?.textContent?.trim();
+                const fileName = row.querySelector('.file-name, .name, [class*="filename" i], [class*="file_name" i]')?.textContent?.trim();
                 return {
                     fid: dataFid,
                     name: fileName || '未命名文件',
@@ -370,53 +383,22 @@
             return null;
         },
 
-        post: (url, data) => {
-            return new Promise((resolve, reject) => {
-                GM_xmlhttpRequest({
-                    method: "POST",
-                    url: url,
-                    headers: {
-                        "Content-Type": "application/json",
-                        "User-Agent": CONFIG.UA,
-                        "Cookie": document.cookie
-                    },
-                    data: JSON.stringify(data),
-                    responseType: 'json',
-                    withCredentials: true,
-                    onload: res => {
-                        if (res.status === 200) {
-                            resolve(res.response);
-                        } else {
-                            reject(res);
-                        }
-                    },
-                    onerror: err => reject(err)
-                });
+        // drive.quark.cn 对 pan.quark.cn 开了 CORS（带凭据），直接用页面自己的会话即可，
+        // 不需要跨域权限；手写 Cookie 反而会丢掉 HttpOnly 的 __pus 导致 401。
+        post: async (url, data) => {
+            const res = await fetch(url, {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
             });
+            return res.json();
         },
 
         // GET 请求
-        get: (url) => {
-            return new Promise((resolve, reject) => {
-                GM_xmlhttpRequest({
-                    method: "GET",
-                    url: url,
-                    headers: {
-                        "User-Agent": CONFIG.UA,
-                        "Cookie": document.cookie
-                    },
-                    responseType: 'json',
-                    withCredentials: true,
-                    onload: res => {
-                        if (res.status === 200) {
-                            resolve(res.response);
-                        } else {
-                            reject(res);
-                        }
-                    },
-                    onerror: err => reject(err)
-                });
-            });
+        get: async (url) => {
+            const res = await fetch(url, { credentials: 'include' });
+            return res.json();
         },
 
         // 获取文件夹内容列表
@@ -550,7 +532,7 @@
                 const outputPath = f.fullPath || f.file_name;
                 // 如果有子目录，先创建目录
                 const dirCmd = f.folderPath ? `mkdir -p "${f.folderPath}" && ` : '';
-                return `${dirCmd}aria2c -c -x 16 -s 16 "${f.download_url}" -o "${outputPath}" -U "${ua}" --header="Cookie: ${document.cookie}"`;
+                return `${dirCmd}aria2c -c -x 16 -s 16 "${f.download_url}" -o "${outputPath}" -U "${ua}" --header="Cookie: ${Utils.getDownloadCookie()}"`;
             }).join('\n\n');
         },
 
@@ -561,7 +543,7 @@
                 const outputPath = f.fullPath || f.file_name;
                 // 如果有子目录，先创建目录
                 const dirCmd = f.folderPath ? `mkdir -p "${f.folderPath}" && ` : '';
-                return `${dirCmd}curl -L -C - "${f.download_url}" -o "${outputPath}" -A "${ua}" -b "${document.cookie}"`;
+                return `${dirCmd}curl -L -C - "${f.download_url}" -o "${outputPath}" -A "${ua}" -b "${Utils.getDownloadCookie()}"`;
             }).join('\n\n');
         },
 
@@ -1165,16 +1147,22 @@
         },
 
         bindShortcuts: () => {
+            if (App._shortcutsBound) return;
+            App._shortcutsBound = true;
             document.addEventListener('keydown', (e) => {
+                const t = e.target;
+                const typing = t && (t.isContentEditable ||
+                    /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || ''));
+
                 // Ctrl+D 快速下载
-                if (e.ctrlKey && e.key === 'd') {
+                if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'd' && !typing) {
                     e.preventDefault();
                     App.run();
                 }
                 // Escape 关闭弹窗
                 if (e.key === 'Escape') {
-                    const modal = document.getElementById('weiruan-modal');
-                    if (modal) modal.remove();
+                    document.getElementById('weiruan-modal')?.remove();
+                    document.getElementById('weiruan-starmap')?.remove();
                 }
             });
         }
@@ -1183,6 +1171,8 @@
     // ==================== 界面 ====================
     const UI = {
         injectStyles: () => {
+            if (UI._stylesInjected) return;
+            UI._stylesInjected = true;
             GM_addStyle(`
                 @keyframes weiruan-toast-in {
                     from { opacity: 0; transform: translate(-50%, -20px); }
@@ -2153,18 +2143,19 @@
 
             const fileListHTML = data.map((f, index) => {
                 const icon = Utils.getFileIcon(f.file_name);
-                const safeUrl = f.download_url.replace(/"/g, '&quot;');
+                const safeUrl = Utils.escapeHtml(f.download_url);
+                const safeName = Utils.escapeHtml(f.file_name);
                 // 显示文件夹路径
                 const folderPathHTML = f.folderPath
-                    ? `<span style="color:var(--weiruan-text-secondary);font-size:11px;margin-left:4px;">📁 ${f.folderPath}/</span>`
+                    ? `<span style="color:var(--weiruan-text-secondary);font-size:11px;margin-left:4px;">📁 ${Utils.escapeHtml(f.folderPath)}/</span>`
                     : '';
 
                 return `
                 <div class="weiruan-file-item" data-type="${Utils.getFileType(f.file_name)}">
                     <div class="weiruan-file-info">
-                        <div class="weiruan-file-name" title="${f.fullPath || f.file_name}">
+                        <div class="weiruan-file-name" title="${Utils.escapeHtml(f.fullPath || f.file_name)}">
                             <span>${icon}</span>
-                            <span>${f.file_name}</span>
+                            <span>${safeName}</span>
                             ${folderPathHTML}
                         </div>
                         <div class="weiruan-file-meta">${Utils.formatSize(f.size)}</div>
@@ -2180,7 +2171,7 @@
             const historyHTML = State.history.length > 0
                 ? State.history.slice(0, 20).map(h => `
                     <div class="weiruan-history-item">
-                        <span class="weiruan-history-name" title="${h.name}">${Utils.getFileIcon(h.name)} ${h.name}</span>
+                        <span class="weiruan-history-name" title="${Utils.escapeHtml(h.name)}">${Utils.getFileIcon(h.name)} ${Utils.escapeHtml(h.name)}</span>
                         <span class="weiruan-history-meta">${Utils.formatSize(h.size)} · ${Utils.formatDate(h.time)}</span>
                     </div>
                 `).join('')
@@ -2313,7 +2304,7 @@
                 btn.addEventListener('click', (e) => {
                     const index = parseInt(e.target.getAttribute('data-index'));
                     const f = data[index];
-                    const curl = `curl -L -C - "${f.download_url}" -o "${f.file_name}" -A "${CONFIG.UA}" -b "${document.cookie}"`;
+                    const curl = `curl -L -C - "${f.download_url}" -o "${f.file_name}" -A "${CONFIG.UA}" -b "${Utils.getDownloadCookie()}"`;
                     GM_setClipboard(curl);
                     Utils.toast(`✅ cURL ${L.copied}`);
                 });
@@ -2323,7 +2314,7 @@
                 btn.addEventListener('click', (e) => {
                     const index = parseInt(e.target.getAttribute('data-index'));
                     const f = data[index];
-                    const aria2 = `aria2c -c -x 16 -s 16 "${f.download_url}" -o "${f.file_name}" -U "${CONFIG.UA}" --header="Cookie: ${document.cookie}"`;
+                    const aria2 = `aria2c -c -x 16 -s 16 "${f.download_url}" -o "${f.file_name}" -U "${CONFIG.UA}" --header="Cookie: ${Utils.getDownloadCookie()}"`;
                     GM_setClipboard(aria2);
                     Utils.toast(`✅ aria2 ${L.copied}`);
                 });
@@ -2617,7 +2608,7 @@
 
             const L = State.getLang();
             tooltip.innerHTML = `
-                <div class="weiruan-starmap-tooltip-name">${Utils.getFileIcon(file.name)} ${file.name}</div>
+                <div class="weiruan-starmap-tooltip-name">${Utils.getFileIcon(file.name)} ${Utils.escapeHtml(file.name)}</div>
                 <div class="weiruan-starmap-tooltip-meta">
                     <span>📦 ${Utils.formatSize(file.size)}</span>
                     <span>📅 ${Utils.formatDate(file.time)}</span>
